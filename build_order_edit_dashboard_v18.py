@@ -1,0 +1,1958 @@
+"""
+Builds order_edit_dashboard.html from order_report_oe joined with store_master
+(for site_name + cluster) in kpnfresh_prod.duckdb.
+
+Tabs:
+  - OVERALL: KPIs, Day/Week/Month trend, Top L1 / Top L2 / Top KSIN
+  - CLUSTER-WISE: pick a cluster -> KPIs, trend, Top L1/L2/KSIN, Store-wise
+    table, Hour-wise impact chart
+
+Usage:
+    python build_order_edit_dashboard.py
+Output:
+    order_edit_dashboard.html (same folder as this script)
+"""
+
+import json
+import os
+import duckdb
+from datetime import datetime
+
+DUCKDB_PATH = r"D:\Data\kpnfresh_prod.duckdb"
+# Fixed output folder -- this is the folder you git add/commit/push to GitHub,
+# so the script can live anywhere but always writes here. The dashboard data
+# is embedded directly inside index.html (as a <script type="application/json">
+# block), so this is now the ONLY file that needs to be uploaded to GitHub.
+OUTPUT_DIR = r"C:\Users\KPN\Documents\Order_Edit"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Named index.html (not order_edit_dashboard.html) so GitHub Pages serves it
+# automatically at the bare repo/folder URL, with no filename in the link.
+OUTPUT_HTML = os.path.join(OUTPUT_DIR, "index.html")
+OE_TABLE = "order_report_oe"
+STORE_TABLE = "store_master"
+
+def main():
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+
+    # Full row-level detail, joined with store_master for site_name + cluster,
+    # plus hour extracted from ord_time. order_report_oe now stores ALL
+    # delivered/partially-delivered lines (not just edited ones), so we filter
+    # to edited_qty <> 0 here to keep this dashboard's scope and payload size
+    # the same as before.
+    rows = con.execute(f"""
+        SELECT
+            oe.ord_dt::VARCHAR                          AS dt,
+            oe.ord_time                                  AS time_str,
+            CAST(SPLIT_PART(oe.ord_time, ':', 1) AS INT) AS hour,
+            oe.order_number,
+            oe.outlet_id,
+            COALESCE(sm.site_name, oe.outlet_id)          AS site_name,
+            COALESCE(sm.cluster_manager, 'UNASSIGNED')    AS cluster,
+            oe.ksin,
+            oe.kpn_title                                  AS title,
+            COALESCE(oe.merchandising_category_l1_name, 'UNKNOWN') AS l1,
+            COALESCE(oe.merchandising_category_l2_name, 'UNKNOWN') AS l2,
+            oe.unit_price,
+            oe.total_ordered_quantity                     AS ordered_qty,
+            oe.total_received_quantity                    AS received_qty,
+            oe.line_gmv,
+            oe.edited_qty,
+            oe.line_edited_gmv,
+            oe.status
+        FROM {OE_TABLE} oe
+        LEFT JOIN (SELECT site_id, site_name, cluster_manager FROM {STORE_TABLE}) sm
+            ON oe.outlet_id = sm.site_id
+        WHERE oe.status = 'PARTIALLY_DELIVERED'
+          AND oe.edited_qty <> 0
+        ORDER BY oe.ord_dt, oe.ord_time
+    """).fetchall()
+
+    rows_json = [
+        {
+            "dt": r[0], "time": r[1], "hour": r[2], "order_number": r[3],
+            "outlet_id": r[4], "site_name": r[5], "cluster": r[6],
+            "ksin": r[7], "title": r[8] or "", "l1": r[9], "l2": r[10],
+            "unit_price": float(r[11] or 0), "ordered_qty": r[12], "received_qty": r[13],
+            "line_gmv": float(r[14] or 0), "edited_qty": r[15],
+            "edited_gmv": float(r[16] or 0), "status": r[17],
+        }
+        for r in rows
+    ]
+
+    # ---- Dictionary-encode the repeated text columns before embedding them
+    # in the page. This drops NO data and NO columns -- every field above is
+    # still present, in full, for every row. It just avoids writing the same
+    # site_name / cluster / l1 / l2 / title / ksin / order_number / outlet_id /
+    # status / dt / time strings out thousands of times: each unique string is
+    # stored once in a small dictionary, and each row stores a compact integer
+    # index into it instead. The dashboard's JS reconstructs the exact same
+    # row objects from this on load, so nothing else about the dashboard's
+    # behavior changes -- this only shrinks the file that has to be uploaded
+    # to GitHub / downloaded by the browser.
+    def _dict_encode(values):
+        uniq = sorted(set(values))
+        index = {v: i for i, v in enumerate(uniq)}
+        return uniq, [index[v] for v in values]
+
+    _dict_cols = ["dt", "time", "order_number", "outlet_id", "site_name",
+                  "cluster", "ksin", "title", "l1", "l2", "status"]
+    _dicts = {}
+    _idx = {}
+    for col in _dict_cols:
+        _dicts[col], _idx[col] = _dict_encode([row[col] for row in rows_json])
+
+    rows_packed = {
+        "dict": _dicts,
+        "hour": [row["hour"] for row in rows_json],
+        "unit_price": [row["unit_price"] for row in rows_json],
+        "ordered_qty": [row["ordered_qty"] for row in rows_json],
+        "received_qty": [row["received_qty"] for row in rows_json],
+        "line_gmv": [row["line_gmv"] for row in rows_json],
+        "edited_qty": [row["edited_qty"] for row in rows_json],
+        "edited_gmv": [row["edited_gmv"] for row in rows_json],
+    }
+    for col in _dict_cols:
+        rows_packed[f"{col}_i"] = _idx[col]
+
+    date_range = con.execute(f"SELECT MIN(ord_dt)::VARCHAR, MAX(ord_dt)::VARCHAR FROM {OE_TABLE}").fetchone()
+
+    # ---- Denominators for "order edit %", now sourced entirely from
+    # order_report_oe (no joins, no other tables):
+    day_totals = con.execute(f"""
+        SELECT ord_dt::VARCHAR, COUNT(DISTINCT order_number) AS total_orders
+        FROM {OE_TABLE}
+        GROUP BY ord_dt
+    """).fetchall()
+    day_totals_json = {r[0]: int(r[1] or 0) for r in day_totals}
+
+    # ---- Store totals, bucketed by date ----
+    store_totals_raw = con.execute(f"""
+        SELECT oe.ord_dt::VARCHAR AS dt,
+               oe.outlet_id,
+               COUNT(DISTINCT oe.order_number) AS total_orders
+        FROM {OE_TABLE} oe
+        GROUP BY 1, 2
+    """).fetchall()
+
+    site_name_by_id = con.execute(f"SELECT site_id, site_name FROM {STORE_TABLE}").fetchall()
+    id_to_name = {r[0]: r[1] for r in site_name_by_id}
+
+    store_totals_json = {}
+    for r in store_totals_raw:
+        dt = r[0]
+        outlet_id = r[1]
+        site_name = id_to_name.get(outlet_id, str(outlet_id))
+        total_orders = int(r[2] or 0)
+        
+        if site_name not in store_totals_json:
+            store_totals_json[site_name] = {}
+        store_totals_json[site_name][dt] = total_orders
+
+    grand_total = con.execute(f"""
+        SELECT COUNT(DISTINCT order_number) FROM {OE_TABLE}
+    """).fetchone()[0]
+    grand_total = int(grand_total or 0)
+
+    # ---- L1 / L2 / KSIN "Total Orders" denominators, bucketed by date ----
+    l1_totals_raw = con.execute(f"""
+        SELECT ord_dt::VARCHAR AS dt,
+               COALESCE(merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COUNT(DISTINCT order_number) AS total_orders
+        FROM {OE_TABLE}
+        GROUP BY 1, 2
+    """).fetchall()
+    l1_totals_json = {}
+    for r in l1_totals_raw:
+        key = r[1]
+        if key not in l1_totals_json:
+            l1_totals_json[key] = {}
+        l1_totals_json[key][r[0]] = int(r[2] or 0)
+
+    l2_totals_raw = con.execute(f"""
+        SELECT ord_dt::VARCHAR AS dt,
+               COALESCE(merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COALESCE(merchandising_category_l2_name, 'UNKNOWN') AS l2,
+               COUNT(DISTINCT order_number) AS total_orders
+        FROM {OE_TABLE}
+        GROUP BY 1, 2, 3
+    """).fetchall()
+    l2_totals_json = {}
+    for r in l2_totals_raw:
+        key = f"{r[1]}||{r[2]}"
+        if key not in l2_totals_json:
+            l2_totals_json[key] = {}
+        l2_totals_json[key][r[0]] = int(r[3] or 0)
+
+    ksin_totals_raw = con.execute(f"""
+        SELECT ord_dt::VARCHAR AS dt,
+               COALESCE(merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COALESCE(merchandising_category_l2_name, 'UNKNOWN') AS l2,
+               ksin,
+               COUNT(DISTINCT order_number) AS total_orders
+        FROM {OE_TABLE}
+        GROUP BY 1, 2, 3, 4
+    """).fetchall()
+    ksin_totals_json = {}
+    for r in ksin_totals_raw:
+        key = f"{r[1]}||{r[2]}||{r[3]}"
+        if key not in ksin_totals_json:
+            ksin_totals_json[key] = {}
+        ksin_totals_json[key][r[0]] = int(r[4] or 0)
+
+    # ---- Cluster-scoped L1 / L2 / KSIN "Total Orders" denominators ----
+    # Same as l1_totals / l2_totals / ksin_totals above, but bucketed by
+    # cluster too (via store_master), so the Cluster-wise tab's "More
+    # Analysis" drill-down can show each category's total orders WITHIN
+    # the selected cluster instead of company-wide across all clusters.
+    l1_totals_by_cluster_raw = con.execute(f"""
+        SELECT oe.ord_dt::VARCHAR AS dt,
+               COALESCE(sm.cluster_manager, 'UNASSIGNED') AS cluster,
+               COALESCE(oe.merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COUNT(DISTINCT oe.order_number) AS total_orders
+        FROM {OE_TABLE} oe
+        LEFT JOIN (SELECT site_id, cluster_manager FROM {STORE_TABLE}) sm
+            ON oe.outlet_id = sm.site_id
+        GROUP BY 1, 2, 3
+    """).fetchall()
+    l1_totals_by_cluster_json = {}
+    for r in l1_totals_by_cluster_raw:
+        dt, cluster, l1, total = r[0], r[1], r[2], int(r[3] or 0)
+        l1_totals_by_cluster_json.setdefault(cluster, {}).setdefault(l1, {})[dt] = total
+
+    l2_totals_by_cluster_raw = con.execute(f"""
+        SELECT oe.ord_dt::VARCHAR AS dt,
+               COALESCE(sm.cluster_manager, 'UNASSIGNED') AS cluster,
+               COALESCE(oe.merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COALESCE(oe.merchandising_category_l2_name, 'UNKNOWN') AS l2,
+               COUNT(DISTINCT oe.order_number) AS total_orders
+        FROM {OE_TABLE} oe
+        LEFT JOIN (SELECT site_id, cluster_manager FROM {STORE_TABLE}) sm
+            ON oe.outlet_id = sm.site_id
+        GROUP BY 1, 2, 3, 4
+    """).fetchall()
+    l2_totals_by_cluster_json = {}
+    for r in l2_totals_by_cluster_raw:
+        dt, cluster, l1, l2, total = r[0], r[1], r[2], r[3], int(r[4] or 0)
+        key = f"{l1}||{l2}"
+        l2_totals_by_cluster_json.setdefault(cluster, {}).setdefault(key, {})[dt] = total
+
+    ksin_totals_by_cluster_raw = con.execute(f"""
+        SELECT oe.ord_dt::VARCHAR AS dt,
+               COALESCE(sm.cluster_manager, 'UNASSIGNED') AS cluster,
+               COALESCE(oe.merchandising_category_l1_name, 'UNKNOWN') AS l1,
+               COALESCE(oe.merchandising_category_l2_name, 'UNKNOWN') AS l2,
+               oe.ksin,
+               COUNT(DISTINCT oe.order_number) AS total_orders
+        FROM {OE_TABLE} oe
+        LEFT JOIN (SELECT site_id, cluster_manager FROM {STORE_TABLE}) sm
+            ON oe.outlet_id = sm.site_id
+        GROUP BY 1, 2, 3, 4, 5
+    """).fetchall()
+    ksin_totals_by_cluster_json = {}
+    for r in ksin_totals_by_cluster_raw:
+        dt, cluster, l1, l2, ksin, total = r[0], r[1], r[2], r[3], r[4], int(r[5] or 0)
+        key = f"{l1}||{l2}||{ksin}"
+        ksin_totals_by_cluster_json.setdefault(cluster, {}).setdefault(key, {})[dt] = total
+
+    con.close()
+
+    # ---- Build the data blob ----
+    data_blob = {
+        "rows": rows_packed,
+        "min_dt": date_range[0],
+        "max_dt": date_range[1],
+        "day_totals": day_totals_json,
+        "store_totals": store_totals_json,
+        "l1_totals": l1_totals_json,
+        "l2_totals": l2_totals_json,
+        "ksin_totals": ksin_totals_json,
+        "l1_totals_by_cluster": l1_totals_by_cluster_json,
+        "l2_totals_by_cluster": l2_totals_by_cluster_json,
+        "ksin_totals_by_cluster": ksin_totals_by_cluster_json,
+        "grand_total": grand_total,
+        "generated_note": "order_report_oe only, no joins to sales tables. DATA.rows already = status PARTIALLY_DELIVERED. Edited order (numerator) = distinct order_number with edited_qty > 0. L1/L2/KSIN 'Total Orders' column = that category's own order count across ALL statuses, bucketed by date and summed for the selected date range. Store 'Total Orders' column = that store's own order count across ALL statuses, bucketed by date and summed for the selected date range. Hour-wise Edited % = edited orders for that hour / total edited orders across ALL hours in the current window (i.e. SUM(...) OVER (PARTITION BY outlet_id, ord_dt) in the source SQL, generalized to whichever stores + date range is currently selected) * 100 -- this is each hour's SHARE of the window's edited orders, not an edit rate against all orders, so values across the 16 hours sum to ~100%.",
+    }
+
+    # ---- Guard against NaN/Infinity: json.dump() writes these as bare,
+    # unquoted tokens by default (allow_nan=True), which is NOT valid JSON.
+    # Python's own json module happily reads that back, but a browser's
+    # JSON.parse() throws a SyntaxError on it -- so a single stray NaN
+    # anywhere in this ~tens-of-MB payload silently breaks the dashboard
+    # for everyone, with an error that looks like a network/fetch failure.
+    # Setting allow_nan=False makes json.dump raise immediately, with a
+    # ValueError, so we catch it here and report exactly which top-level
+    # keys contain the bad values instead of shipping a broken file.
+    def _find_non_finite(obj, path="data_blob"):
+        bad = []
+        if isinstance(obj, float):
+            if obj != obj or obj in (float("inf"), float("-inf")):  # obj != obj catches NaN
+                bad.append(path)
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                bad.extend(_find_non_finite(v, f"{path}[{k!r}]"))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                bad.extend(_find_non_finite(v, f"{path}[{i}]"))
+                if len(bad) > 20:  # don't scan a 50MB list to exhaustion once we have enough
+                    break
+        return bad
+
+    try:
+        data_json_str = json.dumps(data_blob, separators=(",", ":"), allow_nan=False)
+    except ValueError as e:
+        bad_paths = _find_non_finite(data_blob)
+        raise SystemExit(
+            "ERROR: refusing to embed dashboard data -- it contains "
+            "NaN/Infinity values, which are not valid JSON and will make the "
+            "dashboard fail to load in the browser with a misleading "
+            "'Could not load dashboard data' message.\n"
+            f"Original error: {e}\n"
+            f"First offending path(s): {bad_paths[:20]}\n"
+            "Fix the source data (likely a division by zero or a null arithmetic "
+            "result upstream in order_report_oe) or coerce these to 0 before dumping."
+        )
+
+    # Escape "</script" so an embedded string (e.g. a title or ksin) can't
+    # prematurely close the <script id="embedded-data"> tag it's injected
+    # into. This is the standard safe way to embed arbitrary JSON inside
+    # an HTML <script> block.
+    data_json_str_safe = data_json_str.replace("</script", "<\\/script")
+
+    html = HTML_TEMPLATE.replace("__DATA_JSON_PLACEHOLDER__", data_json_str_safe)
+
+    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"Dashboard (data embedded) written to {OUTPUT_HTML}")
+    print(f"Only this ONE file needs to be uploaded to GitHub now.")
+    print(f"Total detail rows: {len(rows_json):,}  |  Date range: {date_range[0]} to {date_range[1]}")
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>KPN Fresh · Order Edit Dashboard</title>
+<link rel="icon" type="image/png" href="https://play-lh.googleusercontent.com/tt3fN6DFHea7-902eGXuDO8O7abRWnMbHWUOzdMGe6sR58E1VXdJSD4XJjuZNjuisD5dlUGXgyURv-QDlt6ZHw=w64-h64">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<script id="embedded-data" type="application/json">__DATA_JSON_PLACEHOLDER__</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@600;700&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0a1729;--navy2:#132a4d;--ink:#0f172a;
+  --accent:#3b5bfd;--accent2:#7c3aed;--teal:#0ea5b7;
+  --green:#0f9d63;--red:#e0293f;--amber:#d97706;
+  --bg:#eef1f8;--surface:#ffffff;--surface2:#f7f9fd;
+  --border:#e2e7f2;--border2:#eef1f8;
+  --muted:#7b8499;--text:#1a2033;
+  --shadow-sm:0 1px 2px rgba(15,23,42,.05);
+  --shadow:0 1px 2px rgba(15,23,42,.04),0 10px 28px -8px rgba(15,23,42,.10);
+  --shadow-lg:0 4px 10px rgba(15,23,42,.06),0 20px 42px -12px rgba(15,23,42,.16);
+  --r:14px;--r-sm:9px;
+  --f:'Inter','Segoe UI',system-ui,sans-serif;
+  --fm:'JetBrains Mono','Consolas',monospace;
+}
+html{scroll-behavior:smooth}
+body{background:
+    radial-gradient(1100px 480px at 12% -8%,rgba(59,91,253,.07),transparent 60%),
+    radial-gradient(900px 420px at 100% 0%,rgba(124,58,237,.06),transparent 55%),
+    var(--bg);
+  font-family:var(--f);font-size:13px;color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased;line-height:1.4}
+
+/* ---------- top bar ---------- */
+.topbar{background:linear-gradient(115deg,var(--navy) 0%,var(--navy2) 55%,#1d3a7a 120%);color:#fff;
+  padding:20px 30px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  box-shadow:0 4px 18px rgba(10,23,41,.35);position:relative;overflow:hidden}
+.topbar::after{content:'';position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(90deg,rgba(255,255,255,.06),transparent 40%);}
+.tb-title{font-size:20px;font-weight:800;letter-spacing:-.2px;display:flex;align-items:center;gap:11px;position:relative}
+.tb-title .ic{width:34px;height:34px;border-radius:10px;background:linear-gradient(140deg,var(--accent),var(--accent2));
+  display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 4px 12px rgba(59,91,253,.45)}
+.tb-sub{font-size:11.5px;color:#9db2dd;margin-top:4px;font-weight:500;letter-spacing:.2px}
+.tb-right{display:flex;align-items:center;gap:10px;font-size:10.5px;color:#a9bde2;font-weight:600}
+.badge{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.16);border-radius:20px;
+  padding:5px 12px;display:flex;align-items:center;gap:6px}
+.dot{width:6px;height:6px;border-radius:50%;background:#34d399;box-shadow:0 0 0 3px rgba(52,211,153,.25)}
+
+/* ---------- tabs ---------- */
+.tabbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 30px;display:flex;gap:4px;
+  position:sticky;top:0;z-index:250;box-shadow:0 1px 0 var(--border)}
+.tab-btn{padding:15px 20px;border:none;background:transparent;cursor:pointer;font-size:12.5px;font-weight:700;
+  color:#9aa3b8;border-bottom:3px solid transparent;letter-spacing:.3px;transition:color .18s,border-color .18s,background .18s;position:relative}
+.tab-btn.active{color:var(--navy);border-bottom-color:var(--accent);background:linear-gradient(180deg,rgba(59,91,253,.05),transparent)}
+.tab-btn:hover:not(.active){color:var(--navy2);background:rgba(59,91,253,.03)}
+
+/* ---------- control bar ---------- */
+.ctrlbar{background:linear-gradient(180deg,#ffffff,#f7f9fd);border-bottom:1px solid var(--border);padding:14px 30px;
+  display:flex;align-items:flex-end;gap:18px;flex-wrap:wrap;position:sticky;top:47px;z-index:200}
+.ctrl-group{display:flex;flex-direction:column;gap:5px}
+.lbl{font-size:9px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+select{padding:8px 12px;border-radius:8px;border:1px solid #d6dcea;font-size:12px;background:#fff;min-width:150px;
+  font-family:var(--f);color:var(--text);transition:border-color .15s,box-shadow .15s;box-shadow:var(--shadow-sm);cursor:pointer}
+select:hover{border-color:var(--accent)}
+select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,91,253,.14)}
+input[type=date]{font-family:var(--f);padding:7px 10px;border-radius:8px;border:1px solid #d6dcea;box-shadow:var(--shadow-sm)}
+.custom-range-wrap{display:flex;gap:6px;align-items:center}
+.custom-range-wrap input[type=date]{width:126px;padding:6px 8px;font-size:12px}
+.custom-range-wrap .crw-to{color:var(--muted);font-size:12px}
+.pg{display:flex;gap:2px;background:#eef1f8;border:1px solid #d6dcea;border-radius:9px;padding:3px}
+.pill{padding:7px 15px;border-radius:7px;border:none;cursor:pointer;font-size:11px;font-weight:700;background:transparent;
+  color:#54607a;transition:all .15s;letter-spacing:.2px}
+.pill.on{background:var(--navy);color:#fff;box-shadow:0 2px 8px rgba(10,23,41,.35)}
+.pill:hover:not(.on){color:var(--navy)}
+
+.tabpane{display:none}
+.tabpane.active{display:block;animation:fadein .25s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+
+.main{padding:24px 30px 40px;display:flex;flex-direction:column;gap:20px;max-width:1720px;margin:0 auto}
+
+/* ---------- KPI cards ---------- */
+.kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
+.kpi-card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);border:1px solid var(--border);
+  padding:18px 18px 16px;position:relative;overflow:hidden;transition:transform .18s,box-shadow .18s}
+.kpi-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.kpi-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:linear-gradient(180deg,var(--accent),var(--teal))}
+.kpi-card.oe::before{background:linear-gradient(180deg,var(--accent2),var(--accent))}
+.kpi-top{display:flex;align-items:flex-start;justify-content:space-between}
+.kpi-lbl{font-size:9.5px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;max-width:75%;line-height:1.4}
+.kpi-daterow{display:flex;align-items:center;justify-content:flex-end;margin-bottom:-6px}
+.kpi-date{font-size:11px;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--border);
+  border-radius:20px;padding:5px 13px;box-shadow:var(--shadow-sm)}
+.kpi-ic{width:26px;height:26px;border-radius:8px;background:linear-gradient(140deg,rgba(59,91,253,.12),rgba(14,165,183,.12));
+  display:flex;align-items:center;justify-content:center;font-size:12.5px;color:var(--accent);flex-shrink:0}
+.kpi-card.oe .kpi-ic{background:linear-gradient(140deg,rgba(124,58,237,.14),rgba(59,91,253,.14));color:var(--accent2)}
+.kpi-val{font-family:var(--fm);font-size:24px;font-weight:700;color:var(--navy);margin-top:11px;letter-spacing:-.3px}
+.kpi-val.red{color:var(--red)}
+
+/* ---------- layout blocks ---------- */
+.charts-row{display:grid;grid-template-columns:2fr 1fr;gap:18px}
+.block{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);
+  transition:box-shadow .18s}
+.block:hover{box-shadow:var(--shadow-lg)}
+.blk-hdr{background:linear-gradient(115deg,var(--navy),var(--navy2));color:#fff;padding:13px 20px;font-size:12px;font-weight:800;
+  letter-spacing:.4px;display:flex;align-items:center;justify-content:space-between;text-transform:uppercase}
+.blk-hdr .tag{font-size:9px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);border-radius:14px;
+  padding:3px 9px;font-weight:700;letter-spacing:.4px;text-transform:none}
+.blk-body{padding:18px}
+canvas{max-width:100%}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:600px}
+th,td{padding:9px 14px;border-bottom:1px solid var(--border2);font-size:12px;text-align:right;white-space:nowrap}
+th{background:var(--surface2);color:#5b6479;font-size:9.5px;text-transform:uppercase;font-weight:800;letter-spacing:.5px;
+  border-bottom:2px solid var(--border);position:sticky;top:0}
+td.left,th.left{text-align:left}
+td{font-family:var(--fm);font-variant-numeric:tabular-nums}
+td.left{font-family:var(--f)}
+tbody tr{transition:background .12s}
+tbody tr:nth-child(even){background:#fbfcfe}
+tbody tr:hover{background:#eef2ff}
+tr.overall-row{background:var(--surface2) !important;font-weight:800}
+tr.overall-row td{border-bottom:2px solid var(--border2);color:var(--text)}
+tr.overall-row td.left{text-transform:uppercase;font-size:11px;letter-spacing:.3px}
+.neg{color:var(--red);font-weight:700}
+.pos{color:var(--green);font-weight:700}
+.oe-chip{display:inline-block;padding:3px 10px;border-radius:20px;font-weight:700;font-size:11px;
+  background:rgba(59,91,253,.10);color:var(--accent);border:1px solid rgba(59,91,253,.16)}
+.oe-chip.hi{background:rgba(224,41,63,.10);color:var(--red);border-color:rgba(224,41,63,.18)}
+.oe-chip.mid{background:rgba(217,119,6,.12);color:var(--amber);border-color:rgba(217,119,6,.2)}
+
+.three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.note{font-size:11px;color:var(--muted);padding:10px 4px 2px;line-height:1.6;border-top:1px dashed var(--border);margin-top:6px}
+.crumb{font-size:12px;font-weight:800;letter-spacing:.4px;text-transform:uppercase}
+.crumb .cr-link{cursor:pointer;color:#9db2dd;text-decoration:none}
+.crumb .cr-link:hover{color:#fff;text-decoration:underline}
+.crumb .cr-sep{color:#6b83b3;margin:0 5px}
+.crumb .cr-current{color:#fff}
+tr.drillable{cursor:pointer}
+tr.drillable:hover{background:#e4eaff !important}
+tr.drillable td.left::after{content:' \203a';color:var(--accent);font-weight:900}
+::-webkit-scrollbar{height:9px;width:9px}
+::-webkit-scrollbar-thumb{background:#c9d2e6;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#a9b6d6}
+@media(max-width:1100px){.kpi-row{grid-template-columns:repeat(2,1fr)}.charts-row,.two-col,.three-col{grid-template-columns:1fr}}
+@media(max-width:1500px) and (min-width:1101px){.kpi-row{grid-template-columns:repeat(3,1fr)}}
+
+/* ---- Loading overlay: pure CSS, no JS dependency, so it keeps animating
+   (compositor-thread transform) even while the browser's main thread is
+   busy parsing/executing the large embedded data script below it. Removed
+   by a single JS line once the first render completes. ---- */
+#loadOverlay{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;
+  background:linear-gradient(160deg,#eef1f8,#e4e9f7);}
+#loadOverlay .lo-badge{width:56px;height:56px;border-radius:16px;background:linear-gradient(140deg,#3b5bfd,#7c3aed);
+  display:flex;align-items:center;justify-content:center;font-size:26px;box-shadow:0 8px 24px rgba(59,91,253,.35);color:#fff}
+#loadOverlay .lo-title{font-family:var(--f);font-size:16px;font-weight:700;color:#1a2033;letter-spacing:.2px}
+#loadOverlay .lo-sub{font-family:var(--f);font-size:12.5px;color:#7b8499}
+#loadOverlay .lo-spinner{width:34px;height:34px;border-radius:50%;
+  border:3px solid rgba(59,91,253,.18);border-top-color:#3b5bfd;
+  animation:lo-spin 0.85s linear infinite;}
+@keyframes lo-spin{to{transform:rotate(360deg)}}
+#loadOverlay.lo-hidden{display:none}
+</style>
+
+</head>
+<body>
+
+<div id="loadOverlay">
+  <div class="lo-badge">📊</div>
+  <div class="lo-title">KPN Fresh &middot; Order Edit Dashboard</div>
+  <div class="lo-spinner"></div>
+  <div class="lo-sub">Loading dashboard data&hellip;</div>
+</div>
+
+<div class="topbar">
+  <div>
+    <div class="tb-title"><span class="ic">📊</span>Order Edit Dashboard</div>
+    <div class="tb-sub" id="subtitle">Partially delivered orders · Chennai zone</div>
+  </div>
+  <div class="tb-right">
+    <span class="badge"><span class="dot"></span><span id="dataLoadedBadge">Data loaded</span></span>
+  </div>
+</div>
+
+<div class="tabbar">
+  <button class="tab-btn active" data-tab="overall">OVERALL</button>
+  <button class="tab-btn" data-tab="cluster">CLUSTER-WISE</button>
+</div>
+
+<div class="ctrlbar">
+  <div class="ctrl-group">
+    <span class="lbl">Date Range</span>
+    <select id="fltRange">
+      <option value="custom">Custom</option>
+      <option value="yesterday" selected>Yesterday</option>
+      <option value="thisweek">This Week</option>
+      <option value="thismonth">This Month</option>
+      <option value="all">All dates</option>
+      <option value="7">Last 7 days</option>
+      <option value="14">Last 14 days</option>
+      <option value="30">Last 30 days</option>
+      <option value="90">Last 90 days</option>
+    </select>
+  </div>
+  <div class="ctrl-group" id="customRangeWrap" style="display:none">
+    <span class="lbl">From — To</span>
+    <div style="display:flex;gap:6px">
+      <input type="date" id="fltFrom" style="padding:5px 8px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px">
+      <input type="date" id="fltTo" style="padding:5px 8px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px">
+    </div>
+  </div>
+  <div class="ctrl-group">
+    <span class="lbl">Trend Grouping</span>
+    <div class="pg" id="pgPeriod">
+      <button class="pill on" data-period="day">Day</button>
+      <button class="pill" data-period="week">Week</button>
+      <button class="pill" data-period="month">Month</button>
+    </div>
+  </div>
+  <div class="ctrl-group" id="clusterSelectorWrap" style="display:none">
+    <span class="lbl">Cluster</span>
+    <select id="fltCluster"></select>
+  </div>
+</div>
+
+<!-- ===================== OVERALL TAB ===================== -->
+<div class="tabpane active" id="pane-overall">
+  <div class="main">
+    <div class="kpi-daterow"><span class="kpi-date" id="kpiDate-overall"></span></div>
+    <div class="kpi-row" id="kpiRow-overall"></div>
+    <div class="block">
+      <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <span id="trendTitle-overall">Edited Impact</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="trend-range-sel" id="trendRange-overall" style="width:130px">
+            <option value="custom">Custom</option>
+            <option value="7">Last 7 days</option>
+            <option value="14" selected>Last 14 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All dates</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+          </select>
+<span class="custom-range-wrap" id="trendRange-overallCustomWrap" style="display:none"><input type="date" id="trendRange-overallFrom"><span class="crw-to">to</span><input type="date" id="trendRange-overallTo"></span>
+          <select class="metric-sel" id="metricTrend-overall" style="width:150px">
+            <option value="oe_pct" selected>OE %</option>
+            <option value="net_gmv">Net GMV</option>
+            <option value="qty">Qty</option>
+            <option value="orders">Orders (distinct)</option>
+          </select>
+        </div>
+      </div>
+      <div class="blk-body"><canvas id="trendChart-overall" height="80"></canvas></div>
+    </div>
+    <div class="block">
+      <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <span id="drillCrumb-overall" class="crumb">Category Drill-down</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="chart-range-sel" id="drillRange-overall" style="width:130px">
+            <option value="custom">Custom</option>
+            <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+            <option value="all">All dates</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+<span class="custom-range-wrap" id="drillRange-overallCustomWrap" style="display:none"><input type="date" id="drillRange-overallFrom"><span class="crw-to">to</span><input type="date" id="drillRange-overallTo"></span>
+          <select class="metric-sel" id="metricDrill-overall" style="width:150px">
+            <option value="oe_pct" selected>OE %</option>
+            <option value="net_gmv">Net GMV</option>
+            <option value="qty">Qty</option>
+            <option value="orders">Orders (distinct)</option>
+          </select>
+        </div>
+      </div>
+      <div class="tw"><table id="drillTable-overall"><thead></thead><tbody></tbody></table></div>
+    </div>
+    <div class="two-col">
+      <div class="block">
+        <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <span>Store-wise Impact</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select class="chart-range-sel" id="storeRange-overall" style="width:130px">
+              <option value="custom">Custom</option>
+              <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+              <option value="all">All dates</option>
+              <option value="7">Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+<span class="custom-range-wrap" id="storeRange-overallCustomWrap" style="display:none"><input type="date" id="storeRange-overallFrom"><span class="crw-to">to</span><input type="date" id="storeRange-overallTo"></span>
+            <select class="metric-sel" id="metricStore-overall" style="width:150px">
+              <option value="oe_pct" selected>OE %</option>
+              <option value="net_gmv">Net GMV</option>
+              <option value="qty">Qty</option>
+              <option value="orders">Orders (distinct)</option>
+            </select>
+          </div>
+        </div>
+        <div class="tw"><table id="storeTable-overall"><thead><tr><th class="left">Store</th><th>OE %</th><th>Total Orders</th><th>Edited Orders</th><th>UNIQUE_EDITED_KSIN</th><th>Edited Qty</th><th>Missed GMV</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="block">
+        <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <span>Hour-wise Impact</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select class="chart-range-sel" id="hourRange-overall" style="width:130px">
+              <option value="custom">Custom</option>
+              <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+              <option value="all">All dates</option>
+              <option value="7">Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+<span class="custom-range-wrap" id="hourRange-overallCustomWrap" style="display:none"><input type="date" id="hourRange-overallFrom"><span class="crw-to">to</span><input type="date" id="hourRange-overallTo"></span>
+            <select class="metric-sel" id="metricHour-overall" style="width:150px">
+              <option value="oe_pct" selected>OE %</option>
+              <option value="net_gmv">Net GMV</option>
+              <option value="qty">Qty</option>
+              <option value="orders">Orders (distinct)</option>
+            </select>
+          </div>
+        </div>
+        <div class="blk-body"><canvas id="hourChart-overall" height="140"></canvas></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== CLUSTER TAB ===================== -->
+<div class="tabpane" id="pane-cluster">
+  <div class="main">
+    <div class="kpi-daterow"><span class="kpi-date" id="kpiDate-cluster"></span></div>
+    <div class="kpi-row" id="kpiRow-cluster"></div>
+    <div class="block">
+      <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <span id="trendTitle-cluster">Edited Impact</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="trend-range-sel" id="trendRange-cluster" style="width:130px">
+            <option value="custom">Custom</option>
+            <option value="7">Last 7 days</option>
+            <option value="14" selected>Last 14 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All dates</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+          </select>
+<span class="custom-range-wrap" id="trendRange-clusterCustomWrap" style="display:none"><input type="date" id="trendRange-clusterFrom"><span class="crw-to">to</span><input type="date" id="trendRange-clusterTo"></span>
+          <select class="metric-sel" id="metricTrend-cluster" style="width:150px">
+            <option value="oe_pct" selected>OE %</option>
+            <option value="net_gmv">Net GMV</option>
+            <option value="qty">Qty</option>
+            <option value="orders">Orders (distinct)</option>
+          </select>
+        </div>
+      </div>
+      <div class="blk-body"><canvas id="trendChart-cluster" height="80"></canvas></div>
+    </div>
+    <div class="block">
+      <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <span id="drillCrumb-cluster" class="crumb">Category Drill-down</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="chart-range-sel" id="drillRange-cluster" style="width:130px">
+            <option value="custom">Custom</option>
+            <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+            <option value="all">All dates</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+<span class="custom-range-wrap" id="drillRange-clusterCustomWrap" style="display:none"><input type="date" id="drillRange-clusterFrom"><span class="crw-to">to</span><input type="date" id="drillRange-clusterTo"></span>
+          <select class="metric-sel" id="metricDrill-cluster" style="width:150px">
+            <option value="oe_pct" selected>OE %</option>
+            <option value="net_gmv">Net GMV</option>
+            <option value="qty">Qty</option>
+            <option value="orders">Orders (distinct)</option>
+          </select>
+        </div>
+      </div>
+      <div class="tw"><table id="drillTable-cluster"><thead></thead><tbody></tbody></table></div>
+    </div>
+    <div class="two-col">
+      <div class="block">
+        <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <span id="storeCrumb-cluster" class="crumb">Store-wise Impact</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select class="chart-range-sel" id="storeRange-cluster" style="width:130px">
+              <option value="custom">Custom</option>
+              <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+              <option value="all">All dates</option>
+              <option value="7">Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+<span class="custom-range-wrap" id="storeRange-clusterCustomWrap" style="display:none"><input type="date" id="storeRange-clusterFrom"><span class="crw-to">to</span><input type="date" id="storeRange-clusterTo"></span>
+            <select class="metric-sel" id="metricStore-cluster" style="width:150px">
+              <option value="oe_pct" selected>OE %</option>
+              <option value="net_gmv">Net GMV</option>
+              <option value="qty">Qty</option>
+              <option value="orders">Orders (distinct)</option>
+            </select>
+          </div>
+        </div>
+        <div class="tw"><table id="storeTable-cluster"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="block">
+        <div class="blk-hdr" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <span>Hour-wise Impact</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="hourStore-cluster" style="width:150px"></select>
+            <select class="chart-range-sel" id="hourRange-cluster" style="width:130px">
+              <option value="custom">Custom</option>
+              <option value="yesterday" selected>Yesterday</option>
+            <option value="thisweek">This Week</option>
+            <option value="thismonth">This Month</option>
+              <option value="all">All dates</option>
+              <option value="7">Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+<span class="custom-range-wrap" id="hourRange-clusterCustomWrap" style="display:none"><input type="date" id="hourRange-clusterFrom"><span class="crw-to">to</span><input type="date" id="hourRange-clusterTo"></span>
+            <select class="metric-sel" id="metricHour-cluster" style="width:150px">
+              <option value="oe_pct" selected>OE %</option>
+              <option value="net_gmv">Net GMV</option>
+              <option value="qty">Qty</option>
+              <option value="orders">Orders (distinct)</option>
+            </select>
+          </div>
+        </div>
+        <div class="blk-body"><canvas id="hourChart-cluster" height="140"></canvas></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let DATA = null;
+const EMBEDDED_DATA = JSON.parse(document.getElementById('embedded-data').textContent);
+
+// Reconstructs the dictionary-encoded row data (fetched from
+// order_edit_dashboard_data.json) into the same array-of-objects shape the
+// rest of this file already expects (r.dt, r.site_name, etc.) -- nothing
+// downstream needs to know the data arrived packed.
+function unpackRows(){
+  const p = DATA.rows;
+  const d = p.dict;
+  const n = p.hour.length;
+  const out = new Array(n);
+  for(let i=0;i<n;i++){
+    out[i] = {
+      dt: d.dt[p.dt_i[i]],
+      time: d.time[p.time_i[i]],
+      hour: p.hour[i],
+      order_number: d.order_number[p.order_number_i[i]],
+      outlet_id: d.outlet_id[p.outlet_id_i[i]],
+      site_name: d.site_name[p.site_name_i[i]],
+      cluster: d.cluster[p.cluster_i[i]],
+      ksin: d.ksin[p.ksin_i[i]],
+      title: d.title[p.title_i[i]],
+      l1: d.l1[p.l1_i[i]],
+      l2: d.l2[p.l2_i[i]],
+      unit_price: p.unit_price[i],
+      ordered_qty: p.ordered_qty[i],
+      received_qty: p.received_qty[i],
+      line_gmv: p.line_gmv[i],
+      edited_qty: p.edited_qty[i],
+      edited_gmv: p.edited_gmv[i],
+      status: d.status[p.status_i[i]],
+    };
+  }
+  DATA.rows = out;
+}
+
+function fmtNum(v){ return Number(v).toLocaleString('en-IN', {maximumFractionDigits: 0}); }
+function fmtMoney(v){ return '\u20b9' + Number(v).toLocaleString('en-IN', {maximumFractionDigits: 0}); }
+function gmvClass(v){ return 'neg'; /* Missed GMV is always shown in red, regardless of sign */ }
+function oeChip(pct){
+  if(pct == null) return '<td>n/a</td>';
+  const cls = pct >= 15 ? 'hi' : (pct >= 7 ? 'mid' : '');
+  return `<td><span class="oe-chip ${cls}">${pct.toFixed(2)}%</span></td>`;
+}
+
+let charts = {};
+let currentPeriod = 'day'; // day | week | month
+
+// ---------- date bucketing helpers ----------
+function mondayOfWeek(dateStr){
+  const d = new Date(dateStr + 'T00:00:00Z');
+  const dayNr = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dayNr);
+  return d.toISOString().slice(0,10);
+}
+function monthKey(dateStr){ return dateStr.slice(0,7); }
+
+// ISO-8601 week number for a given date string (yyyy-mm-dd).
+function isoWeekNumber(dateStr){
+  const d = new Date(dateStr + 'T00:00:00Z');
+  const dayNr = (d.getUTCDay() + 6) % 7; // Mon=0..Sun=6
+  d.setUTCDate(d.getUTCDate() - dayNr + 3); // nearest Thursday
+  const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  const fDayNr = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - fDayNr + 3);
+  const weekNr = 1 + Math.round((d - firstThursday) / (7 * 24 * 3600 * 1000));
+  return weekNr;
+}
+// Display label for a week bucket (bucket key = Monday date string), e.g. "Wk 05".
+function weekBucketLabel(mondayStr){
+  return `Wk ${String(isoWeekNumber(mondayStr)).padStart(2,'0')}`;
+}
+// Whether a week bucket (Monday date string) is the current, still-running week.
+function isCurrentWeekBucket(mondayStr){
+  const todayMonday = mondayOfWeek(new Date().toISOString().slice(0,10));
+  return mondayStr === todayMonday;
+}
+// Display label for a month bucket (bucket key = "YYYY-MM"), e.g. "Aug 2026".
+function monthBucketLabel(monthStr){
+  const [y, m] = monthStr.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1, 1));
+  return d.toLocaleDateString('en-US', { month:'short', year:'numeric', timeZone:'UTC' });
+}
+// Whether a month bucket ("YYYY-MM") is the current, still-running month.
+function isCurrentMonthBucket(monthStr){
+  const now = new Date();
+  const cur = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  return monthStr === cur;
+}
+// "Yesterday" = the most recent date present in the data (DATA.max_dt).
+// The dataset is built with data through the last completed day, i.e.
+// max_dt already IS yesterday relative to today -- it should not be
+// shifted back by another day (that was showing 02-Aug when the data's
+// actual latest date, and the real "yesterday", was 03-Aug).
+function yesterdayDateStr(){
+  return DATA.max_dt;
+}
+
+function bucketKey(dateStr, period){
+  if(period === 'week') return mondayOfWeek(dateStr);
+  if(period === 'month') return monthKey(dateStr);
+  return dateStr;
+}
+
+// ---------- filtering ----------
+function datesInWindow(rangeVal, fromVal, toVal){
+  const dates = Object.keys(DATA.day_totals);
+  if(rangeVal === 'all') return dates;
+  if(rangeVal === 'yesterday'){
+    const y = yesterdayDateStr();
+    return dates.filter(d => d === y);
+  }
+  if(rangeVal === 'thisweek'){
+    const monday = mondayOfWeek(yesterdayDateStr());
+    return dates.filter(d => d >= monday);
+  }
+  if(rangeVal === 'thismonth'){
+    const prefix = monthKey(yesterdayDateStr());
+    return dates.filter(d => d.startsWith(prefix));
+  }
+  if(rangeVal === 'custom' || (typeof rangeVal === 'string' && rangeVal.startsWith('custom:'))){
+    let f = fromVal, t = toVal;
+    if(rangeVal.startsWith('custom:')){ const p = rangeVal.split(':'); f = p[1]; t = p[2]; }
+    if(!f && !t) return dates;
+    return dates.filter(d => (!f || d >= f) && (!t || d <= t));
+  }
+  const maxDt = new Date(DATA.max_dt);
+  const cutoff = new Date(maxDt); cutoff.setDate(cutoff.getDate() - parseInt(rangeVal));
+  return dates.filter(d => new Date(d) >= cutoff);
+}
+
+function rowsInWindow(rows, rangeVal, fromVal, toVal){
+  if(rangeVal === 'all') return rows;
+  if(rangeVal === 'yesterday'){
+    const y = yesterdayDateStr();
+    return rows.filter(r => r.dt === y);
+  }
+  if(rangeVal === 'thisweek'){
+    const monday = mondayOfWeek(yesterdayDateStr());
+    return rows.filter(r => r.dt >= monday);
+  }
+  if(rangeVal === 'thismonth'){
+    const prefix = monthKey(yesterdayDateStr());
+    return rows.filter(r => r.dt.startsWith(prefix));
+  }
+  if(rangeVal === 'custom' || (typeof rangeVal === 'string' && rangeVal.startsWith('custom:'))){
+    let f = fromVal, t = toVal;
+    if(rangeVal.startsWith('custom:')){ const p = rangeVal.split(':'); f = p[1]; t = p[2]; }
+    if(!f && !t) return rows;
+    return rows.filter(r => (!f || r.dt >= f) && (!t || r.dt <= t));
+  }
+  const maxDt = new Date(DATA.max_dt);
+  const cutoff = new Date(maxDt); cutoff.setDate(cutoff.getDate() - parseInt(rangeVal));
+  return rows.filter(r => new Date(r.dt) >= cutoff);
+}
+
+function applyDateRange(rows){
+  const range = document.getElementById('fltRange').value;
+  const from = document.getElementById('fltFrom').value;
+  const to = document.getElementById('fltTo').value;
+  return rowsInWindow(rows, range, from, to);
+}
+
+function trendRowsForTab(rows, suffix){
+  const range = getEffectiveRange(`trendRange-${suffix}`);
+  return rowsInWindow(rows, range, null, null);
+}
+
+function trendDayTotalsByBucket(suffix){
+  const range = getEffectiveRange(`trendRange-${suffix}`);
+  const inRange = datesInWindow(range, null, null);
+  const m = new Map();
+  inRange.forEach(d=>{
+    const k = bucketKey(d, currentPeriod);
+    m.set(k, (m.get(k)||0) + (DATA.day_totals[d]||0));
+  });
+  return m;
+}
+
+function aggregate(rows, keyFn){
+  const m = new Map();
+  rows.forEach(r=>{
+    const k = keyFn(r);
+    if(!m.has(k)) m.set(k, {orders:new Set(), editedOrders:new Set(), ksins:new Set(), editedKsins:new Set(), qty:0, net_gmv:0, gross_gmv:0, meta:{}});
+    const e = m.get(k);
+    e.orders.add(r.order_number);
+    e.ksins.add(r.ksin);
+    if(Math.abs(r.edited_qty) > 0){
+      e.editedOrders.add(r.order_number);
+      e.editedKsins.add(r.ksin);
+    }
+    e.qty += Math.abs(r.edited_qty);
+    e.net_gmv += r.edited_gmv;
+    e.gross_gmv += Math.abs(r.edited_gmv);
+    if(!e.meta.title && r.title) e.meta.title = r.title;
+    if(!e.meta.outlet_id && r.outlet_id) e.meta.outlet_id = r.outlet_id;
+  });
+  return [...m.entries()].map(([k,v])=>({
+    key:k, orders:v.orders.size, edited_orders:v.editedOrders.size,
+    ksin_count:v.ksins.size, edited_ksin_count:v.editedKsins.size,
+    qty:v.qty, net_gmv:v.net_gmv, gross_gmv:v.gross_gmv, meta:v.meta
+  }));
+}
+
+// Sum a category's totals across dates in the current range
+function sumTotalsForRange(totalsDict, key, rangeVal) {
+    const dates = datesInWindow(rangeVal, null, null);
+    if (!totalsDict[key]) return 0;
+    return dates.reduce((sum, d) => sum + (totalsDict[key][d] || 0), 0);
+}
+
+// Sum a store's totals across dates in the current range
+function sumStoreTotalsForRange(storeName, rangeVal) {
+    const dates = datesInWindow(rangeVal, null, null);
+    if (!DATA.store_totals[storeName]) return 0;
+    return dates.reduce((sum, d) => sum + (DATA.store_totals[storeName][d] || 0), 0);
+}
+
+// Sum totals across MULTIPLE stores (e.g. every store in a cluster) for
+// dates in the current range -- used for cluster-scoped "Total Orders"
+// denominators instead of the single-store version above.
+function sumStoreTotalsForRangeMulti(storeNames, rangeVal) {
+    const dates = datesInWindow(rangeVal, null, null);
+    return (storeNames || []).reduce((tot, s) => {
+        if (!DATA.store_totals[s]) return tot;
+        return tot + dates.reduce((sum, d) => sum + (DATA.store_totals[s][d] || 0), 0);
+    }, 0);
+}
+
+// Same as sumStoreTotalsForRangeMulti, but scoped to the top KPI bar's
+// date filter (fltRange / fltFrom / fltTo) instead of a per-block range
+// selector -- mirrors sumDayTotalsInRange() but for a set of stores.
+function sumStoreTotalsForFilterRange(storeNames) {
+    const range = document.getElementById('fltRange').value;
+    const from = document.getElementById('fltFrom').value;
+    const to = document.getElementById('fltTo').value;
+    const dates = datesInWindow(range, from, to);
+    return (storeNames || []).reduce((tot, s) => {
+        if (!DATA.store_totals[s]) return tot;
+        return tot + dates.reduce((sum, d) => sum + (DATA.store_totals[s][d] || 0), 0);
+    }, 0);
+}
+
+// Which stores belong to a given cluster (used to scope KPIs / drill-down
+// denominators to just that cluster instead of the whole company).
+function storesForCluster(clusterName){
+  return [...new Set(DATA.rows.filter(r=>r.cluster === clusterName).map(r=>r.site_name))];
+}
+
+function renderOverallRow(labelColspan, label, editPct, qty, netGmv, extraCells){
+  const pctCell = editPct == null ? '<td>n/a</td>' : `<td><span class="oe-chip">${editPct.toFixed(2)}%</span></td>`;
+  return `<tr class="overall-row">
+    <td class="left" colspan="${labelColspan}">${label}</td>
+    ${pctCell}
+    ${extraCells || ''}
+    <td>${fmtNum(qty)}</td>
+    <td class="${gmvClass(netGmv)}">${fmtMoney(netGmv)}</td>
+  </tr>`;
+}
+
+if(window.ChartDataLabels){
+  Chart.register(window.ChartDataLabels);
+  Chart.defaults.set('plugins.datalabels', { display:false });
+}
+
+// Shows the actual date(s) the top KPI row currently reflects, e.g.
+// "03 Aug 2026" for Yesterday, or "21 Jul 2026 – 03 Aug 2026" for a range.
+function fmtDateNice(d){
+  const dt = new Date(d + 'T00:00:00Z');
+  return dt.toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric', timeZone:'UTC' });
+}
+function setKpiDateLabel(elId, rangeVal, fromVal, toVal){
+  const el = document.getElementById(elId);
+  if(!el) return;
+  const dates = datesInWindow(rangeVal, fromVal, toVal).sort();
+  if(!dates.length){ el.textContent = 'No data in range'; return; }
+  const first = dates[0], last = dates[dates.length-1];
+  el.textContent = first === last ? `Showing: ${fmtDateNice(first)}` : `Showing: ${fmtDateNice(first)} \u2013 ${fmtDateNice(last)}`;
+}
+
+function renderKPIs(rows, targetId, oePct, totalOrdersDenom){
+  const editedOrders = new Set(rows.map(r=>r.order_number)).size;
+  const totalQty = rows.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+  const netGmv = rows.reduce((a,r)=>a+r.edited_gmv,0);
+  const totalKsin = new Set(rows.map(r=>r.ksin)).size;
+  const cards = [
+    {lbl:'Orders (Total)', val: fmtNum(totalOrdersDenom||0), ic:'\u25a4'},
+    {lbl:'Edited Orders (distinct)', val: fmtNum(editedOrders), ic:'\u2318'},
+    {lbl:'OE % (Edited \u00f7 Total Orders)', val: (oePct != null ? oePct.toFixed(2) + '%' : 'n/a'), ic:'\u25c9', oe:true},
+    {lbl:'Missed GMV (Edited GMV)', val: fmtMoney(netGmv), cls: 'red', ic:'\u20b9'},
+    {lbl:'Total Edited Qty', val: fmtNum(totalQty), ic:'\u2261'},
+    {lbl:'Total Edited KSIN (distinct)', val: fmtNum(totalKsin), ic:'\u2317'},
+  ];
+  document.getElementById(targetId).innerHTML = cards.map(c=>`
+    <div class="kpi-card ${c.oe?'oe':''}">
+      <div class="kpi-top"><div class="kpi-lbl">${c.lbl}</div><div class="kpi-ic">${c.ic||''}</div></div>
+      <div class="kpi-val ${c.cls||''}">${c.val}</div>
+    </div>`).join('');
+}
+
+const METRIC_LABELS = {
+  net_gmv: 'Net Edited GMV', qty: 'Edited Qty', orders: 'Edited Orders (distinct)', oe_pct: 'OE %'
+};
+function isMoneyMetric(metric){ return metric === 'net_gmv'; }
+function fmtMetric(v, metric){ return isMoneyMetric(metric) ? fmtMoney(v) : fmtNum(v); }
+
+function isWeekendDayKey(k){
+  if(currentPeriod !== 'day') return false;
+  const day = new Date(k + 'T00:00:00Z').getUTCDay();
+  return day === 0 || day === 6;
+}
+function weekdayAbbrev(k){
+  return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(k + 'T00:00:00Z').getUTCDay()];
+}
+
+function movingAverageTrendLine(values, windowSize){
+  windowSize = windowSize || 3;
+  const half = Math.floor(windowSize / 2);
+  return values.map((_, i) => {
+    const start = Math.max(0, i - half);
+    const end = Math.min(values.length, i + half + 1);
+    const slice = values.slice(start, end).filter(v => v != null && !isNaN(v));
+    if(slice.length === 0) return null;
+    return slice.reduce((a,b)=>a+b, 0) / slice.length;
+  });
+}
+
+function renderTrendChart(rows, canvasId, chartKey, metric, totalsByBucketMap, titleElId, titleSuffix, rangeSelId){
+  let byBucket = aggregate(rows, r=>bucketKey(r.dt, currentPeriod)).sort((a,b)=>a.key.localeCompare(b.key));
+
+  let values, label, isPct = false;
+  if(metric === 'oe_pct'){
+    values = byBucket.map(d => {
+      const total = totalsByBucketMap.get(d.key) || 0;
+      return total ? (d.orders / total) * 100 : null;
+    });
+    label = 'OE %'; isPct = true;
+  } else {
+    values = byBucket.map(d=>d[metric]);
+    label = METRIC_LABELS[metric];
+  }
+
+  if(titleElId){
+    const titleEl = document.getElementById(titleElId);
+    const rangeSel = rangeSelId ? document.getElementById(rangeSelId) : null;
+    const rangeLabel = rangeSel && rangeSel.selectedOptions.length ? rangeSel.selectedOptions[0].textContent : '';
+    if(titleEl) titleEl.textContent = `Edited Impact${rangeLabel ? ' (' + rangeLabel + ')' : ''}${titleSuffix || ''}`;
+  }
+
+  let bestIdx = -1, bestVal = Infinity;
+  values.forEach((v,i)=>{ if(v!=null && v<bestVal){ bestVal=v; bestIdx=i; } });
+
+  const trendValues = movingAverageTrendLine(values);
+
+  const barColors = byBucket.map((d,i)=>{
+    if(i === bestIdx) return '#0f9d63';
+    if(isWeekendDayKey(d.key)) return '#f59e0b';
+    return 'rgba(29,78,216,0.55)';
+  });
+
+  const xLabels = byBucket.map(d => {
+    if(currentPeriod === 'week'){
+      return weekBucketLabel(d.key) + (isCurrentWeekBucket(d.key) ? '*' : '');
+    }
+    if(currentPeriod === 'month'){
+      return monthBucketLabel(d.key) + (isCurrentMonthBucket(d.key) ? '*' : '');
+    }
+    return isWeekendDayKey(d.key) ? `${d.key} (${weekdayAbbrev(d.key)})` : d.key;
+  });
+
+  const ctx = document.getElementById(canvasId);
+  if(charts[chartKey]) charts[chartKey].destroy();
+  charts[chartKey] = new Chart(ctx, {
+    data:{
+      labels: xLabels,
+      datasets:[
+        { type:'bar', label, data: values, backgroundColor: barColors, borderRadius:4, order:2,
+          datalabels:{ display:true, align:'end', anchor:'end', color:'#0f2547', font:{weight:'700', size:10},
+            formatter:(v,dlCtx)=>{
+              if(v==null) return '';
+              const star = dlCtx.dataIndex === bestIdx ? '\u2605 ' : '';
+              return star + (isPct ? v.toFixed(1)+'%' : fmtMetric(v, metric));
+            }
+          }
+        },
+        { type:'line', label:'Trend', data: trendValues, borderColor:'#7c3aed', borderWidth:2.5,
+          pointRadius:0, fill:false, tension:0.4, order:1, spanGaps:true,
+          datalabels:{ display:false }
+        }
+      ]
+    },
+    options:{ responsive:true,
+      layout:{ padding:{ top:20 } },
+      scales:{ y:{title:{display:true, text: isPct ? 'OE %' : (isMoneyMetric(metric) ? 'GMV (\u20b9)' : label)} } },
+      plugins:{ legend:{display:false} }
+    }
+  });
+}
+
+function sumDayTotalsForRangeVal(rangeVal){
+  return datesInWindow(rangeVal, null, null).reduce((a,d)=>a + (DATA.day_totals[d]||0), 0);
+}
+
+function sumDayTotalsInRange(){
+  const range = document.getElementById('fltRange').value;
+  const from = document.getElementById('fltFrom').value;
+  const to = document.getElementById('fltTo').value;
+  return datesInWindow(range, from, to).reduce((a,d)=>a + (DATA.day_totals[d]||0), 0);
+}
+
+function dayTotalsByBucket(){
+  const range = document.getElementById('fltRange').value;
+  const from = document.getElementById('fltFrom').value;
+  const to = document.getElementById('fltTo').value;
+  const inRange = datesInWindow(range, from, to);
+  const m = new Map();
+  inRange.forEach(d=>{
+    const k = bucketKey(d, currentPeriod);
+    m.set(k, (m.get(k)||0) + (DATA.day_totals[d]||0));
+  });
+  return m;
+}
+
+function editPct(orders, totalKey, totalsDict){
+  const total = totalsDict[totalKey];
+  if(!total) return null;
+  return (orders / total) * 100;
+}
+
+function editShare(orders, totalEditedOrders){
+  if(!totalEditedOrders) return null;
+  return (orders / totalEditedOrders) * 100;
+}
+
+// ---------- drill-down: L1 -> L2 -> KSIN ----------
+const drillState = { overall: {level:'l1', l1:null, l2:null}, cluster: {level:'l1', l1:null, l2:null} };
+const lastDrillRows = { overall: [], cluster: [] };
+
+function drillInto(suffix, key){
+  const st = drillState[suffix];
+  if(st.level === 'l1'){ st.l1 = key; st.level = 'l2'; }
+  else if(st.level === 'l2'){ st.l2 = key; st.level = 'ksin'; }
+  renderDrillTable(lastDrillRows[suffix], suffix);
+}
+function drillReset(suffix){
+  drillState[suffix] = {level:'l1', l1:null, l2:null};
+  renderDrillTable(lastDrillRows[suffix], suffix);
+}
+function drillUpToL2(suffix){
+  const st = drillState[suffix];
+  st.level = 'l2'; st.l2 = null;
+  renderDrillTable(lastDrillRows[suffix], suffix);
+}
+window.drillReset = drillReset; window.drillUpToL2 = drillUpToL2;
+
+function escapeAttr(s){
+  return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setupDrillClickHandler(suffix){
+  const table = document.getElementById(`drillTable-${suffix}`);
+  table.addEventListener('click', (e)=>{
+    const tr = e.target.closest('tr.drillable');
+    if(!tr || !table.contains(tr)) return;
+    const key = tr.getAttribute('data-drill-key');
+    drillInto(suffix, key);
+  });
+}
+
+function renderDrillTable(rows, suffix){
+  lastDrillRows[suffix] = rows;
+  const st = drillState[suffix];
+  const metric = document.getElementById(`metricDrill-${suffix}`).value;
+  const rangeVal = getEffectiveRange(`drillRange-${suffix}`);
+
+  // On the Cluster tab, every "Total Orders" denominator below must be
+  // scoped to the selected cluster -- not company-wide -- otherwise the
+  // "Overall" row (and every category's Total Orders) silently shows the
+  // all-clusters figure while still being labeled "Overall" for this cluster.
+  const isCluster = suffix === 'cluster';
+  const clusterName = isCluster ? document.getElementById('fltCluster').value : null;
+  const clusterStores = isCluster ? storesForCluster(clusterName) : null;
+  const l1Dict = isCluster ? (DATA.l1_totals_by_cluster[clusterName] || {}) : DATA.l1_totals;
+  const l2Dict = isCluster ? (DATA.l2_totals_by_cluster[clusterName] || {}) : DATA.l2_totals;
+  const ksinDict = isCluster ? (DATA.ksin_totals_by_cluster[clusterName] || {}) : DATA.ksin_totals;
+
+  const totalOrdersAllStatus = isCluster
+    ? sumStoreTotalsForRangeMulti(clusterStores, rangeVal)
+    : datesInWindow(rangeVal, null, null).reduce((a,d)=>a+(DATA.day_totals[d]||0), 0);
+
+  let agg = [];
+  let cols = [];
+  let keyLabelFn = function(o){ return o.key; };
+  let clickable = false;
+  let includeTitle = false;
+  let overallQty = 0;
+  let overallGmv = 0;
+  let overallKsinCount = 0;
+  let overallEditedOrders = 0;
+  let overallTotalOrders = 0; // "Total Orders" denominator scoped to whatever level we're viewing
+
+  if(st.level === 'l1'){
+    const totalEditedOrdersAll = new Set(rows.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg = aggregate(rows, r=>r.l1);
+    agg.forEach(o=>{
+      o.totalOrders = sumTotalsForRange(l1Dict, o.key, rangeVal);
+      // OE% here = this L1's share of ALL edited orders (edited_orders / overall
+      // edited orders), not an edit-rate within the category.
+      o.editPct = totalEditedOrdersAll ? (o.edited_orders / totalEditedOrdersAll) * 100 : null;
+    });
+    cols = ['L1','OE %','Total Orders','Edited Orders','UNIQUE_EDITED_KSIN','Edited Qty','Missed GMV'];
+    keyLabelFn = o=>o.key;
+    clickable = true;
+    overallQty = rows.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = rows.reduce((a,r)=>a+r.edited_gmv,0);
+    overallKsinCount = new Set(rows.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.ksin)).size;
+    overallEditedOrders = totalEditedOrdersAll;
+    overallTotalOrders = totalOrdersAllStatus; // whole store's total orders
+
+  } else if(st.level === 'l2'){
+    const subset = rows.filter(r=>r.l1 === st.l1);
+    agg = aggregate(subset, r=>r.l2);
+    const totalEditedForL1 = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg.forEach(o=>{
+      o.totalOrders = sumTotalsForRange(l2Dict, `${st.l1}||${o.key}`, rangeVal);
+      // OE% here = this L2's share of the parent L1's total edited orders.
+      o.editPct = totalEditedForL1 ? (o.edited_orders / totalEditedForL1) * 100 : null;
+    });
+    cols = ['L2','OE %','Total Orders','Edited Orders','UNIQUE_EDITED_KSIN','Edited Qty','Missed GMV'];
+    keyLabelFn = o=>o.key;
+    clickable = true;
+    overallQty = subset.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = subset.reduce((a,r)=>a+r.edited_gmv,0);
+    overallKsinCount = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.ksin)).size;
+    overallEditedOrders = totalEditedForL1;
+    overallTotalOrders = sumTotalsForRange(l1Dict, st.l1, rangeVal); // this L1's own total orders (cluster-scoped on Cluster tab)
+
+  } else {
+    const subset = rows.filter(r=>r.l1 === st.l1 && r.l2 === st.l2);
+    agg = aggregate(subset, r=>r.ksin);
+    const totalEditedForL2 = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg.forEach(o=>{
+      o.totalOrders = sumTotalsForRange(ksinDict, `${st.l1}||${st.l2}||${o.key}`, rangeVal);
+      // OE% here = this KSIN's share of the parent L2's total edited orders.
+      o.editPct = totalEditedForL2 ? (o.edited_orders / totalEditedForL2) * 100 : null;
+    });
+    cols = ['KSIN','Title','OE %','Total Orders','Edited Orders','Edited Qty','Missed GMV'];
+    keyLabelFn = o=>o.key;
+    includeTitle = true;
+    clickable = false;
+    overallQty = subset.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = subset.reduce((a,r)=>a+r.edited_gmv,0);
+    overallEditedOrders = totalEditedForL2;
+    overallTotalOrders = sumTotalsForRange(l2Dict, `${st.l1}||${st.l2}`, rangeVal); // this L2's own total orders (cluster-scoped on Cluster tab)
+  }
+
+  const sortVal = (o)=> metric === 'oe_pct' ? (o.editPct == null ? -Infinity : o.editPct) : o[metric];
+  agg = agg.sort((a,b)=>sortVal(b)-sortVal(a)).slice(0,15);
+
+  const thead = document.querySelector(`#drillTable-${suffix} thead`);
+  thead.innerHTML = '<tr>' + cols.map(c=>`<th class="${c==='L1'||c==='L2'||c==='KSIN'||c==='Title'?'left':''}">${c}</th>`).join('') + '</tr>';
+
+  const overallExtra = includeTitle
+    ? `<td>${fmtNum(overallTotalOrders)}</td><td>${fmtNum(overallEditedOrders)}</td>`
+    : `<td>${fmtNum(overallTotalOrders)}</td><td>${fmtNum(overallEditedOrders)}</td><td>${fmtNum(overallKsinCount)}</td>`;
+
+  // Overall row's OE% = this level's own edited orders / this level's own total orders --
+  // e.g. drilling into "FMCG Food" shows FMCG Food's real OE%, not a hard-coded 100%.
+  const overallPct = overallTotalOrders ? (overallEditedOrders / overallTotalOrders) * 100 : null;
+
+  const overallRowHtml = renderOverallRow(includeTitle ? 2 : 1, 'Overall', overallPct, overallQty, overallGmv, overallExtra);
+
+  const tbody = document.querySelector(`#drillTable-${suffix} tbody`);
+  tbody.innerHTML = overallRowHtml + agg.map(o=>{
+    const rowAttrs = clickable ? ` class="drillable" data-drill-key="${escapeAttr(o.key)}"` : '';
+    return `<tr${rowAttrs}>
+      <td class="left">${keyLabelFn(o)}</td>
+      ${includeTitle ? `<td class="left">${o.meta.title||''}</td>` : ''}
+      ${oeChip(o.editPct)}
+      <td>${fmtNum(o.totalOrders)}</td>
+      <td>${fmtNum(o.edited_orders)}</td>
+      ${includeTitle ? '' : `<td>${fmtNum(o.edited_ksin_count)}</td>`}
+      <td>${fmtNum(o.qty)}</td>
+      <td class="${gmvClass(o.net_gmv)}">${fmtMoney(o.net_gmv)}</td>
+    </tr>`;
+  }).join('');
+
+  const crumb = document.getElementById(`drillCrumb-${suffix}`);
+  let html = `<span class="cr-link" onclick="drillReset('${suffix}')">More Analysis: L1 / L2 / KSIN-wise</span>`;
+  if(st.level === 'l2'){
+    html += `<span class="cr-sep">\u203a</span><span class="cr-current">${st.l1}</span>`;
+  } else if(st.level === 'ksin'){
+    html += `<span class="cr-sep">\u203a</span><span class="cr-link" onclick="drillUpToL2('${suffix}')">${st.l1}</span>`;
+    html += `<span class="cr-sep">\u203a</span><span class="cr-current">${st.l2}</span>`;
+  }
+  crumb.innerHTML = html;
+}
+
+// ---------- Store-wise table (non-drillable for overall tab) ----------
+function renderGenericTable(rows, keyFn, tableId, metric, rangeSelId){
+  let agg = aggregate(rows, keyFn);
+  const rangeVal = rangeSelId ? document.getElementById(rangeSelId).value : 'all';
+  
+  agg.forEach(o=>{
+    o.totalOrders = sumStoreTotalsForRange(o.key, rangeVal);
+    o.editPct = o.totalOrders ? (o.orders / o.totalOrders) * 100 : null;
+  });
+  
+  const sortVal = (o)=> metric === 'oe_pct' ? (o.editPct == null ? -Infinity : o.editPct) : o[metric];
+  agg = agg.sort((a,b)=>sortVal(b)-sortVal(a));
+
+  const totalOrdersAllStatus = datesInWindow(rangeVal, null, null)
+    .reduce((a,d)=>a+(DATA.day_totals[d]||0), 0);
+  const overallEditedOrders = new Set(rows.map(r=>r.order_number)).size;
+  const overallEditPct = totalOrdersAllStatus ? (overallEditedOrders / totalOrdersAllStatus) * 100 : null;
+  const overallQty = rows.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+  const overallGmv = rows.reduce((a,r)=>a+r.edited_gmv,0);
+  const overallKsinCount = new Set(rows.map(r=>r.ksin)).size;
+  
+  const overallExtra = `<td>${fmtNum(totalOrdersAllStatus)}</td><td>${fmtNum(overallEditedOrders)}</td><td>${fmtNum(overallKsinCount)}</td>`;
+  const overallRowHtml = renderOverallRow(1, 'Overall', overallEditPct, overallQty, overallGmv, overallExtra);
+
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  tbody.innerHTML = overallRowHtml + agg.map(o=>`
+    <tr><td class="left">${o.key}</td>
+    ${oeChip(o.editPct)}
+    <td>${fmtNum(o.totalOrders)}</td>
+    <td>${fmtNum(o.orders)}</td>
+    <td>${fmtNum(o.ksin_count)}</td>
+    <td>${fmtNum(o.qty)}</td>
+    <td class="${gmvClass(o.net_gmv)}">${fmtMoney(o.net_gmv)}</td></tr>`).join('');
+}
+
+// ---------- Store-wise drill-down: Store -> L1 -> L2 -> KSIN ----------
+const storeDrillState = { cluster: {level:'store', store:null, l1:null, l2:null} };
+const lastStoreDrillRows = { cluster: [] };
+
+function storeDrillInto(suffix, key){
+  const st = storeDrillState[suffix];
+  if(st.level === 'store'){ st.store = key; st.level = 'l1'; }
+  else if(st.level === 'l1'){ st.l1 = key; st.level = 'l2'; }
+  else if(st.level === 'l2'){ st.l2 = key; st.level = 'ksin'; }
+  renderStoreDrillTable(lastStoreDrillRows[suffix], suffix);
+}
+function storeDrillReset(suffix){
+  storeDrillState[suffix] = {level:'store', store:null, l1:null, l2:null};
+  renderStoreDrillTable(lastStoreDrillRows[suffix], suffix);
+}
+function storeDrillUpToStore(suffix){
+  const st = storeDrillState[suffix];
+  st.level = 'l1'; st.l1 = null; st.l2 = null;
+  renderStoreDrillTable(lastStoreDrillRows[suffix], suffix);
+}
+function storeDrillUpToL1(suffix){
+  const st = storeDrillState[suffix];
+  st.level = 'l1'; st.l1 = null; st.l2 = null;
+  renderStoreDrillTable(lastStoreDrillRows[suffix], suffix);
+}
+function storeDrillUpToL2(suffix){
+  const st = storeDrillState[suffix];
+  st.level = 'l2'; st.l2 = null;
+  renderStoreDrillTable(lastStoreDrillRows[suffix], suffix);
+}
+window.storeDrillReset = storeDrillReset;
+window.storeDrillUpToStore = storeDrillUpToStore;
+window.storeDrillUpToL1 = storeDrillUpToL1;
+window.storeDrillUpToL2 = storeDrillUpToL2;
+
+function setupStoreDrillClickHandler(suffix){
+  const table = document.getElementById(`storeTable-${suffix}`);
+  if(!table) return;
+  table.addEventListener('click', (e)=>{
+    const tr = e.target.closest('tr.drillable');
+    if(!tr || !table.contains(tr)) return;
+    const key = tr.getAttribute('data-store-drill-key');
+    storeDrillInto(suffix, key);
+  });
+}
+
+function renderStoreDrillTable(rows, suffix){
+  lastStoreDrillRows[suffix] = rows;
+  const st = storeDrillState[suffix];
+  const metric = document.getElementById(`metricStore-${suffix}`).value;
+
+  const rangeVal = getEffectiveRange(`storeRange-${suffix}`);
+  // At the top "All Stores" level, this must be scoped to the cluster's own
+  // stores on the Cluster tab (not company-wide) -- otherwise the "Overall"
+  // row's Total Orders shows every cluster's orders while labeled Overall
+  // for just this one. Once drilled into a specific store, the store's own
+  // total already correctly scopes it regardless of tab.
+  const isCluster = suffix === 'cluster';
+  const clusterStores = isCluster ? storesForCluster(document.getElementById('fltCluster').value) : null;
+  const totalOrdersAllStatus = isCluster
+    ? sumStoreTotalsForRangeMulti(clusterStores, rangeVal)
+    : datesInWindow(rangeVal, null, null).reduce((a,d)=>a+(DATA.day_totals[d]||0), 0);
+  const scopeTotalOrders = st.level === 'store'
+    ? totalOrdersAllStatus
+    : sumStoreTotalsForRange(st.store, rangeVal); // drilled into one store: that store's own total
+
+  let subset = rows;
+  if(st.level !== 'store') subset = subset.filter(r=>r.site_name === st.store);
+  if(st.level === 'l2' || st.level === 'ksin') subset = subset.filter(r=>r.l1 === st.l1);
+  if(st.level === 'ksin') subset = subset.filter(r=>r.l2 === st.l2);
+
+  let agg = [];
+  let cols = [];
+  let includeTitle = false;
+  let includeOutlet = false;
+  let clickable = true;
+  let overallQty = 0;
+  let overallGmv = 0;
+  let overallKsinCount = 0;
+  let overallEditedOrders = 0;
+  let overallEditPct = null;
+  
+  if(st.level === 'store'){
+    agg = aggregate(rows, r=>r.site_name);
+    const totalEditedAll = new Set(rows.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg.forEach(o=>{
+      o.totalOrders = sumStoreTotalsForRange(o.key, rangeVal);
+      // OE% here = this store's share of ALL edited orders in scope (cluster-
+      // wide on the Cluster tab), same "share of overall edits" logic as the
+      // L1/L2/KSIN category table -- not an edit-rate within the store.
+      o.editPct = totalEditedAll ? (o.edited_orders / totalEditedAll) * 100 : null;
+    });
+    cols = ['Store','Outlet ID','OE %','Total Orders','Edited Orders','UNIQUE_EDITED_KSIN','Edited Qty','Missed GMV'];
+    includeOutlet = true;
+    overallEditedOrders = totalEditedAll;
+    overallEditPct = scopeTotalOrders ? (overallEditedOrders / scopeTotalOrders) * 100 : null;
+    overallQty = rows.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = rows.reduce((a,r)=>a+r.edited_gmv,0);
+    overallKsinCount = new Set(rows.map(r=>r.ksin)).size;
+    
+  } else if(st.level === 'l1'){
+    const totalEditedForStore = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg = aggregate(subset, r=>r.l1);
+    agg.forEach(o=>{
+      const l1Subset = subset.filter(r=>r.l1 === o.key);
+      o.totalOrders = new Set(l1Subset.map(r=>r.order_number)).size;
+      o.editPct = totalEditedForStore ? (o.edited_orders / totalEditedForStore) * 100 : null;
+    });
+    cols = ['L1','OE %','Total Orders','Edited Orders','UNIQUE_EDITED_KSIN','Edited Qty','Missed GMV'];
+    overallEditedOrders = totalEditedForStore;
+    // True edit-rate for the OVERALL row, same idea as the More Analysis table:
+    // edited orders in this scope / total orders in this scope (the store's
+    // total orders -- store-level Total Orders is the finest breakdown the
+    // data has, so it's reused as the denominator through L1/L2/KSIN too).
+    overallEditPct = scopeTotalOrders ? (overallEditedOrders / scopeTotalOrders) * 100 : null;
+    overallQty = subset.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = subset.reduce((a,r)=>a+r.edited_gmv,0);
+    overallKsinCount = new Set(subset.map(r=>r.ksin)).size;
+    
+  } else if(st.level === 'l2'){
+    const totalEditedForL1 = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg = aggregate(subset, r=>r.l2);
+    agg.forEach(o=>{
+      const l2Subset = subset.filter(r=>r.l2 === o.key);
+      o.totalOrders = new Set(l2Subset.map(r=>r.order_number)).size;
+      o.editPct = totalEditedForL1 ? (o.edited_orders / totalEditedForL1) * 100 : null;
+    });
+    cols = ['L2','OE %','Total Orders','Edited Orders','UNIQUE_EDITED_KSIN','Edited Qty','Missed GMV'];
+    overallEditedOrders = totalEditedForL1;
+    overallEditPct = scopeTotalOrders ? (overallEditedOrders / scopeTotalOrders) * 100 : null;
+    overallQty = subset.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = subset.reduce((a,r)=>a+r.edited_gmv,0);
+    overallKsinCount = new Set(subset.map(r=>r.ksin)).size;
+    
+  } else {
+    const totalEditedForL2 = new Set(subset.filter(r=>Math.abs(r.edited_qty) > 0).map(r=>r.order_number)).size;
+    agg = aggregate(subset, r=>r.ksin);
+    agg.forEach(o=>{
+      const ksinSubset = subset.filter(r=>r.ksin === o.key);
+      o.totalOrders = new Set(ksinSubset.map(r=>r.order_number)).size;
+      o.editPct = totalEditedForL2 ? (o.edited_orders / totalEditedForL2) * 100 : null;
+    });
+    cols = ['KSIN','Title','OE %','Total Orders','Edited Orders','Edited Qty','Missed GMV'];
+    overallEditedOrders = totalEditedForL2;
+    overallEditPct = scopeTotalOrders ? (overallEditedOrders / scopeTotalOrders) * 100 : null;
+    overallQty = subset.reduce((a,r)=>a+Math.abs(r.edited_qty),0);
+    overallGmv = subset.reduce((a,r)=>a+r.edited_gmv,0);
+    includeTitle = true;
+    clickable = false;
+  }
+
+  const sortVal = (o)=> metric === 'oe_pct' ? (o.editPct == null ? -Infinity : o.editPct) : o[metric];
+  agg = agg.sort((a,b)=>sortVal(b)-sortVal(a)).slice(0,15);
+
+  const thead = document.querySelector(`#storeTable-${suffix} thead`);
+  thead.innerHTML = '<tr>' + cols.map(c=>`<th class="${c==='Store'||c==='Outlet ID'||c==='L1'||c==='L2'||c==='KSIN'||c==='Title'?'left':''}">${c}</th>`).join('') + '</tr>';
+
+  const overallExtra = includeTitle
+    ? `<td>${fmtNum(scopeTotalOrders)}</td><td>${fmtNum(overallEditedOrders)}</td>`
+    : `<td>${fmtNum(scopeTotalOrders)}</td><td>${fmtNum(overallEditedOrders)}</td><td>${fmtNum(overallKsinCount)}</td>`;
+  const overallRowHtml = renderOverallRow(includeTitle || includeOutlet ? 2 : 1, 'Overall', overallEditPct, overallQty, overallGmv, overallExtra);
+
+  const tbody = document.querySelector(`#storeTable-${suffix} tbody`);
+  tbody.innerHTML = overallRowHtml + agg.map(o=>{
+    const rowAttrs = clickable ? ` class="drillable" data-store-drill-key="${escapeAttr(o.key)}"` : '';
+    return `<tr${rowAttrs}>
+      <td class="left">${o.key}</td>
+      ${includeTitle ? `<td class="left">${o.meta.title||''}</td>` : ''}
+      ${includeOutlet ? `<td class="left">${o.meta.outlet_id||''}</td>` : ''}
+      ${oeChip(o.editPct)}
+      <td>${fmtNum(o.totalOrders)}</td>
+      <td>${fmtNum(o.orders)}</td>
+      ${includeTitle ? '' : `<td>${fmtNum(o.ksin_count)}</td>`}
+      <td>${fmtNum(o.qty)}</td>
+      <td class="${gmvClass(o.net_gmv)}">${fmtMoney(o.net_gmv)}</td>
+    </tr>`;
+  }).join('');
+
+  const crumb = document.getElementById(`storeCrumb-${suffix}`);
+  if(crumb){
+    let html = `<span class="cr-link" onclick="storeDrillReset('${suffix}')">All Stores</span>`;
+    if(st.level === 'l1'){
+      html += `<span class="cr-sep">\u203a</span><span class="cr-current">${st.store}</span>`;
+    } else if(st.level === 'l2'){
+      html += `<span class="cr-sep">\u203a</span><span class="cr-link" onclick="storeDrillUpToStore('${suffix}')">${st.store}</span>`;
+      html += `<span class="cr-sep">\u203a</span><span class="cr-current">${st.l1}</span>`;
+    } else if(st.level === 'ksin'){
+      html += `<span class="cr-sep">\u203a</span><span class="cr-link" onclick="storeDrillUpToStore('${suffix}')">${st.store}</span>`;
+      html += `<span class="cr-sep">\u203a</span><span class="cr-link" onclick="storeDrillUpToL1('${suffix}')">${st.l1}</span>`;
+      html += `<span class="cr-sep">\u203a</span><span class="cr-current">${st.l2}</span>`;
+    }
+    crumb.innerHTML = html;
+  }
+}
+
+// ================================================================
+// renderHourChart: dynamic Y-Axis, NaN-safe. OE% is now the hour's SHARE
+// of total edited orders in the current window (matches the source SQL:
+// numerator = edited orders in that hour, denominator = SUM of edited
+// orders across all hours for that outlet_id/ord_dt, generalized here to
+// sum across whichever stores + dates are currently in scope). Values
+// across all hours sum to ~100%. No longer depends on "all statuses"
+// hour totals.
+// ================================================================
+function renderHourChart(rows, canvasId, chartKey, metric){
+  const HOURS = Array.from({length:16}, (_,i)=>7+i);
+  const hourRows = rows.filter(r => HOURS.includes(r.hour));
+  
+  // Aggregate by hour - this gives us edited orders per hour
+  const byHour = aggregate(hourRows, r=>r.hour);
+  const hourMap = new Map(byHour.map(h=>[Number(h.key), h]));
+
+  let values, label, isPct = false;
+  if(metric === 'oe_pct'){
+    label = 'Edited %'; isPct = true;
+    // Denominator = total edited orders across ALL hours in this window
+    // (sum of each hour's edited_orders, i.e. SUM(...) OVER (PARTITION BY
+    // outlet_id, ord_dt) in the source query, generalized to the current
+    // store + date scope).
+    const totalEditedInWindow = byHour.reduce((a,h)=>a+h.edited_orders,0);
+    values = HOURS.map(h=>{
+      const e = hourMap.get(h);
+      const editedThisHour = e ? e.edited_orders : 0;
+      // If there are no edited orders in the window, force 0.0 instead of NaN
+      if (totalEditedInWindow === 0) return 0.0;
+      // Hourly Edited % = edited orders this hour / total edited orders in window * 100
+      return (editedThisHour / totalEditedInWindow) * 100;
+    });
+  } else {
+    label = METRIC_LABELS[metric];
+    values = HOURS.map(h => hourMap.has(h) ? hourMap.get(h)[metric] : 0);
+  }
+
+  // Calculate dynamic Y-Axis max (Highest value + 25% padding)
+  let maxVal = Math.max(...values.filter(v => v !== null && isFinite(v)));
+  // Absolute minimum Y-Axis floor of 20% in case all values are 0 or very low
+  let yMax = Math.max(maxVal * 1.25, 20);
+
+  const ctx = document.getElementById(canvasId);
+  if(charts[chartKey]) charts[chartKey].destroy();
+  charts[chartKey] = new Chart(ctx, {
+    type:'bar',
+    data:{
+      labels: HOURS.map(h=>`${String(h).padStart(2,'0')}:00`),
+      datasets:[{
+        label, 
+        data: values, 
+        backgroundColor:'#0e7490', 
+        borderRadius:4,
+        datalabels: { 
+          display: true, 
+          align: 'end', 
+          anchor: 'end', 
+          color: '#0f2547', 
+          font: { weight: '700', size: 10 },
+          formatter: (v) => v == null || !isFinite(v) ? '' : (isPct ? v.toFixed(1) + '%' : fmtMetric(v, metric)) 
+        }
+      }]
+    },
+    options: { 
+      responsive: true, 
+      layout: { padding: { top: 20 } },
+      scales: { 
+        y: { 
+          max: yMax, // DYNAMIC Y-AXIS: Bars won't be cut off anymore
+          title: { display: true, text: isPct ? 'OE %' : label },
+          ticks: { callback: (val) => isPct ? val.toFixed(0) + '%' : val } 
+        } 
+      },
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+// ---------- OVERALL tab ----------
+function renderOverall(){
+  const rows = applyDateRange(DATA.rows);
+  const totalOrdersInRange = new Set(rows.map(r=>r.order_number)).size;
+  const rangeTotal = sumDayTotalsInRange();
+  const oePct = rangeTotal ? (totalOrdersInRange / rangeTotal) * 100 : null;
+  renderKPIs(rows, 'kpiRow-overall', oePct, rangeTotal);
+  setKpiDateLabel('kpiDate-overall', document.getElementById('fltRange').value, document.getElementById('fltFrom').value, document.getElementById('fltTo').value);
+  try {
+    const trendRowsO = trendRowsForTab(DATA.rows, 'overall');
+    renderTrendChart(trendRowsO, 'trendChart-overall', 'overall_trend', document.getElementById('metricTrend-overall').value, trendDayTotalsByBucket('overall'), 'trendTitle-overall', '', 'trendRange-overall');
+  } catch(err){ console.error('Trend chart failed:', err); }
+  
+  const drillRangeVal = getEffectiveRange('drillRange-overall');
+  const drillRows = rowsInWindow(DATA.rows, drillRangeVal, null, null);
+  renderDrillTable(drillRows, 'overall');
+
+  const storeRangeVal = getEffectiveRange('storeRange-overall');
+  const storeRows = rowsInWindow(DATA.rows, storeRangeVal, null, null);
+  renderGenericTable(storeRows, r=>r.site_name, 'storeTable-overall', document.getElementById('metricStore-overall').value, 'storeRange-overall');
+
+  try {
+    const hourRangeVal = getEffectiveRange('hourRange-overall');
+    const hourRows = rowsInWindow(DATA.rows, hourRangeVal, null, null);
+    renderHourChart(hourRows, 'hourChart-overall', 'overall_hour', document.getElementById('metricHour-overall').value);
+  } catch(err){ console.error('Hour chart failed:', err); }
+}
+
+// ---------- CLUSTER tab ----------
+function populateClusterSelector(){
+  const clusters = [...new Set(DATA.rows.map(r=>r.cluster))].sort();
+  const sel = document.getElementById('fltCluster');
+  sel.innerHTML = clusters.map(c=>`<option value="${c}">${c}</option>`).join('');
+}
+
+// Populates the required Hour-wise Impact store dropdown with the stores
+// belonging to the selected cluster. Keeps the current selection if it's
+// still valid for the (possibly new) cluster, otherwise defaults to the
+// first store -- the filter is required, so there is no "All stores" option.
+function populateHourStoreSelector(clusterStores){
+  const sel = document.getElementById('hourStore-cluster');
+  const stores = [...clusterStores].sort();
+  const prev = sel.value;
+  sel.innerHTML = '<option value="__ALL__">Overall</option>' +
+    stores.map(s=>`<option value="${s}">${s}</option>`).join('');
+  if(prev === '__ALL__' || stores.includes(prev)){
+    sel.value = prev;
+  } else {
+    sel.value = '__ALL__';
+  }
+}
+
+function renderCluster(){
+  const cluster = document.getElementById('fltCluster').value;
+  let rows = applyDateRange(DATA.rows);
+  rows = rows.filter(r=>r.cluster === cluster);
+  const clusterBaseRows = DATA.rows.filter(r=>r.cluster === cluster);
+
+  const storesInCluster = new Set(clusterBaseRows.map(r=>r.site_name));
+  populateHourStoreSelector(storesInCluster);
+  // NOTE: DATA.store_totals[store] is a {date: count} object, not a number --
+  // it must be summed per-date over the KPI bar's date filter, not added
+  // directly (that was producing NaN in the "Orders (Total)" KPI card).
+  const clusterTotal = sumStoreTotalsForFilterRange([...storesInCluster]);
+  const totalOrdersInRange = new Set(rows.map(r=>r.order_number)).size;
+  const oePct = clusterTotal ? (totalOrdersInRange / clusterTotal) * 100 : null;
+
+  renderKPIs(rows, 'kpiRow-cluster', oePct, clusterTotal);
+  setKpiDateLabel('kpiDate-cluster', document.getElementById('fltRange').value, document.getElementById('fltFrom').value, document.getElementById('fltTo').value);
+  try {
+    const trendRowsC = trendRowsForTab(clusterBaseRows, 'cluster');
+    renderTrendChart(trendRowsC, 'trendChart-cluster', 'cluster_trend', document.getElementById('metricTrend-cluster').value, trendDayTotalsByBucket('cluster'), 'trendTitle-cluster', cluster ? ` — ${cluster}` : '', 'trendRange-cluster');
+  } catch(err){ console.error('Trend chart failed:', err); }
+  
+  const drillRangeVal = getEffectiveRange('drillRange-cluster');
+  const drillRows = rowsInWindow(clusterBaseRows, drillRangeVal, null, null);
+  renderDrillTable(drillRows, 'cluster');
+
+  const storeRangeVal = getEffectiveRange('storeRange-cluster');
+  const storeRows = rowsInWindow(clusterBaseRows, storeRangeVal, null, null);
+  renderStoreDrillTable(storeRows, 'cluster');
+
+  try {
+    const hourRangeVal = getEffectiveRange('hourRange-cluster');
+    const hourStoreVal = document.getElementById('hourStore-cluster').value;
+    const hourStoreRows = (hourStoreVal === '__ALL__')
+      ? clusterBaseRows
+      : clusterBaseRows.filter(r=>r.site_name === hourStoreVal);
+    const hourRows = rowsInWindow(hourStoreRows, hourRangeVal, null, null);
+    renderHourChart(hourRows, 'hourChart-cluster', 'cluster_hour', document.getElementById('metricHour-cluster').value);
+  } catch(err){ console.error('Hour chart failed:', err); }
+}
+
+function renderActiveTab(){
+  const active = document.querySelector('.tab-btn.active').dataset.tab;
+  if(active === 'overall') renderOverall();
+  else renderCluster();
+}
+
+// The ids of every per-block "current range" selector (Category Drill-down,
+// Store-wise Impact, Hour-wise Impact) across both tabs -- these follow the
+// Week/Month Trend Grouping defaults, same as the top KPI row.
+const CHART_RANGE_SEL_IDS = [
+  'drillRange-overall', 'storeRange-overall', 'hourRange-overall',
+  'drillRange-cluster', 'storeRange-cluster', 'hourRange-cluster'
+];
+const TREND_RANGE_SEL_IDS = ['trendRange-overall', 'trendRange-cluster'];
+// Original (page-load) defaults, restored when Trend Grouping is set back to "Day".
+const ORIGINAL_DEFAULTS = { fltRange: 'yesterday', chart: 'yesterday', trend: { 'trendRange-overall': '14', 'trendRange-cluster': '14' } };
+
+function setSelectValue(id, val){
+  const el = document.getElementById(id);
+  if(el && el.querySelector(`option[value="${val}"]`)) el.value = val;
+  syncCustomWrap(id);
+}
+
+// Shows/hides a range-selector's paired Custom from/to date inputs
+// based on whether "Custom" is currently selected.
+function syncCustomWrap(id){
+  const sel = document.getElementById(id);
+  const wrap = document.getElementById(`${id}CustomWrap`);
+  if(!sel || !wrap) return;
+  wrap.style.display = (sel.value === 'custom') ? 'flex' : 'none';
+}
+
+// Returns the value to actually filter by for a given range-selector id.
+// For every option except Custom this is just the select's own value.
+// For Custom it's a composite "custom:FROM:TO" string built from the
+// selector's paired date inputs -- datesInWindow/rowsInWindow parse this
+// directly, so every existing call site that already threads a bare
+// rangeVal through (sumTotalsForRange, sumStoreTotalsForRange, etc.)
+// gets Custom support for free, with no other code changes needed.
+function getEffectiveRange(id){
+  const sel = document.getElementById(id);
+  if(!sel) return 'all';
+  if(sel.value === 'custom'){
+    const f = document.getElementById(`${id}From`);
+    const t = document.getElementById(`${id}To`);
+    return `custom:${f ? f.value : ''}:${t ? t.value : ''}`;
+  }
+  return sel.value;
+}
+
+// Applies the Trend Grouping's date-range defaults:
+//  - Day:   restores each selector's original default (Yesterday / 14 / 90).
+//  - Week:  top KPIs + every chart-range-sel default to "This Week";
+//           Edited Impact (trend-range-sel) defaults to "Last 30 days".
+//  - Month: top KPIs + every chart-range-sel default to "This Month";
+//           Edited Impact defaults to "All dates" (full min ord_dt -> max ord_dt).
+function applyTrendGroupingDefaults(period){
+  if(period === 'week'){
+    setSelectValue('fltRange', 'thisweek');
+    CHART_RANGE_SEL_IDS.forEach(id => setSelectValue(id, 'thisweek'));
+    TREND_RANGE_SEL_IDS.forEach(id => setSelectValue(id, '30'));
+  } else if(period === 'month'){
+    setSelectValue('fltRange', 'thismonth');
+    CHART_RANGE_SEL_IDS.forEach(id => setSelectValue(id, 'thismonth'));
+    TREND_RANGE_SEL_IDS.forEach(id => setSelectValue(id, 'all'));
+  } else {
+    setSelectValue('fltRange', ORIGINAL_DEFAULTS.fltRange);
+    CHART_RANGE_SEL_IDS.forEach(id => setSelectValue(id, ORIGINAL_DEFAULTS.chart));
+    TREND_RANGE_SEL_IDS.forEach(id => setSelectValue(id, ORIGINAL_DEFAULTS.trend[id]));
+  }
+  document.getElementById('customRangeWrap').style.display =
+    (document.getElementById('fltRange').value === 'custom') ? 'flex' : 'none';
+}
+
+// ---------- tab switching ----------
+function initDashboard(){
+document.querySelectorAll('.tab-btn').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
+    document.getElementById('clusterSelectorWrap').style.display = (btn.dataset.tab === 'cluster') ? 'flex' : 'none';
+    renderActiveTab();
+  });
+});
+
+document.querySelectorAll('#pgPeriod .pill').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('#pgPeriod .pill').forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+    currentPeriod = btn.dataset.period;
+    applyTrendGroupingDefaults(currentPeriod);
+    renderActiveTab();
+  });
+});
+
+document.getElementById('fltRange').addEventListener('change', ()=>{
+  document.getElementById('customRangeWrap').style.display =
+    (document.getElementById('fltRange').value === 'custom') ? 'flex' : 'none';
+  renderActiveTab();
+});
+document.getElementById('fltFrom').addEventListener('change', renderActiveTab);
+document.getElementById('fltTo').addEventListener('change', renderActiveTab);
+document.getElementById('fltCluster').addEventListener('change', ()=>{ drillReset('cluster'); storeDrillState.cluster = {level:'store', store:null, l1:null, l2:null}; renderCluster(); });
+document.getElementById('hourStore-cluster').addEventListener('change', renderCluster);
+
+document.querySelectorAll('.metric-sel').forEach(sel=>{
+  sel.addEventListener('change', renderActiveTab);
+});
+// Every trend-range-sel / chart-range-sel also needs to show/hide its
+// paired Custom from/to date inputs, and those date inputs need to
+// trigger a re-render themselves once both are picked.
+document.querySelectorAll('.trend-range-sel, .chart-range-sel').forEach(sel=>{
+  sel.addEventListener('change', ()=>{ syncCustomWrap(sel.id); renderActiveTab(); });
+  const wrap = document.getElementById(`${sel.id}CustomWrap`);
+  if(wrap){
+    wrap.querySelectorAll('input[type=date]').forEach(inp=>{
+      inp.addEventListener('change', renderActiveTab);
+    });
+  }
+});
+
+document.getElementById('subtitle').textContent =
+  `Data range: ${DATA.min_dt || 'n/a'} to ${DATA.max_dt || 'n/a'}`;
+document.getElementById('dataLoadedBadge').textContent =
+  `Data loaded \u00b7 through ${DATA.max_dt || 'n/a'}`;
+
+setupDrillClickHandler('overall');
+setupDrillClickHandler('cluster');
+setupStoreDrillClickHandler('cluster');
+populateClusterSelector();
+document.getElementById('fltFrom').min = DATA.min_dt; document.getElementById('fltFrom').max = DATA.max_dt;
+document.getElementById('fltTo').min = DATA.min_dt; document.getElementById('fltTo').max = DATA.max_dt;
+document.getElementById('fltFrom').value = DATA.min_dt;
+document.getElementById('fltTo').value = DATA.max_dt;
+renderOverall();
+
+// Data is parsed and the first paint has happened -- dismiss the loading
+// overlay. requestAnimationFrame (rather than removing it inline right
+// after renderOverall()) waits for the browser to actually paint the
+// rendered dashboard first, so there's no flash of an empty shell.
+requestAnimationFrame(()=>{
+  const ov = document.getElementById('loadOverlay');
+  if(ov) ov.classList.add('lo-hidden');
+});
+} // end initDashboard
+
+// ---------- bootstrap: data is embedded above as EMBEDDED_DATA, no fetch needed ----------
+try{
+  DATA = EMBEDDED_DATA;
+  unpackRows();
+  initDashboard();
+}catch(err){
+  console.error('Failed to load dashboard data:', err);
+  const ov = document.getElementById('loadOverlay');
+  if(ov){
+    ov.innerHTML = '<div style="max-width:360px;text-align:center;font-family:var(--f)">'
+      + '<div style="font-size:15px;font-weight:700;color:#c0392b;margin-bottom:8px">Could not load dashboard data</div>'
+      + '<div style="font-size:12.5px;color:#7b8499;line-height:1.5">The embedded data block appears to be missing or corrupted.</div>'
+      + '</div>';
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
